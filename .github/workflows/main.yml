@@ -1,0 +1,268 @@
+name: AnyDesk Official CLI Setup
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-anydesk:
+    runs-on: windows-latest
+    steps:
+      - name: 1. Install & Connect Tailscale
+        shell: powershell
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          $botToken = "8741257302:AAEqt3JMWjghmx6JU8uQmuhazOnetwRP690"
+          $chatId = "2063422375"
+          function Send-Telegram {
+            param([string]$m)
+            try {
+              $enc = [uri]::EscapeDataString($m)
+              Invoke-WebRequest -Uri "https://api.telegram.org/bot$botToken/sendMessage?chat_id=$chatId&text=$enc" -UseBasicParsing -TimeoutSec 10 | Out-Null
+            } catch {
+              Write-Host "TG err: $_"
+            }
+          }
+          Send-Telegram "Workflow Started - Run ID: ${{ github.run_id }}"
+
+          try {
+            # 1. Download Tailscale
+            Send-Telegram "Downloading Tailscale installer..."
+            $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.92.3-amd64.msi"
+            $installerPath = "$env:TEMP\tailscale.msi"
+            Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -ErrorAction Stop
+
+            # 2. Install Tailscale
+            Send-Telegram "Installing Tailscale silently..."
+            $installProcess = Start-Process -FilePath "msiexec.exe" -ArgumentList "/i `"$installerPath`" /quiet /norestart" -Wait -PassThru
+            if ($installProcess.ExitCode -ne 0) {
+              Send-Telegram "Tailscale installation failed with exit code: $($installProcess.ExitCode)"
+              throw "Installation failed"
+            }
+
+            # 3. Verify installation
+            $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+            if (-not (Test-Path $tsExe)) {
+              $tsExe = (Get-Command "tailscale.exe" -ErrorAction SilentlyContinue).Source
+              if (-not $tsExe) {
+                Send-Telegram "tailscale.exe not found after installation!"
+                throw "tailscale.exe missing"
+              }
+            }
+            Send-Telegram "Tailscale found at: $tsExe"
+
+            # 4. Connect to Tailscale
+            $authKey = $env:TAILSCALE_AUTHKEY
+            $connected = $false
+            $tsIP = ""
+
+            if (-not [string]::IsNullOrEmpty($authKey)) {
+              Send-Telegram "Auth key found. Connecting Tailscale with key..."
+              $maxRetries = 3
+              $retryCount = 0
+              while ($retryCount -lt $maxRetries -and -not $connected) {
+                $retryCount++
+                try {
+                  $output = & $tsExe up --authkey="$authKey" --hostname="gh-runner-${{ github.run_id }}" 2>&1
+                  if ($LASTEXITCODE -eq 0) {
+                    $connected = $true
+                    Send-Telegram "Tailscale up succeeded (authkey)."
+                  } else {
+                    Send-Telegram "Tailscale up failed with exit code: $LASTEXITCODE. Output: $output"
+                    Start-Sleep -Seconds 5
+                  }
+                } catch {
+                  Send-Telegram "Error running tailscale up: $_"
+                  Start-Sleep -Seconds 5
+                }
+              }
+            } else {
+              Send-Telegram "No auth key found. Using interactive login (link will be sent)."
+              
+              # Run tailscale up without authkey and capture all output
+              $output = & $tsExe up --hostname="gh-runner-${{ github.run_id }}" 2>&1
+              $fullOutput = $output -join "`n"
+              
+              Send-Telegram "Tailscale command output:"
+              Send-Telegram $fullOutput
+              
+              # Try multiple patterns to extract login URL
+              $loginUrl = ""
+              $patterns = @(
+                "(https://login\.tailscale\.com/a/[a-zA-Z0-9]+)",
+                "(https://[a-z]+\.tailscale\.com/[a-zA-Z0-9]+)",
+                "(https://[^\s]+tailscale[^\s]+)"
+              )
+              foreach ($pattern in $patterns) {
+                if ($fullOutput -match $pattern) {
+                  $loginUrl = $Matches[1]
+                  break
+                }
+              }
+              
+              if ($loginUrl) {
+                Send-Telegram "LOGIN LINK: $loginUrl"
+                Send-Telegram "Please open this link and authenticate. Waiting up to 30 minutes..."
+                
+                $timeout = (Get-Date).AddMinutes(30)
+                while ((Get-Date) -lt $timeout -and -not $connected) {
+                  Start-Sleep -Seconds 30
+                  $ip = & $tsExe ip -4 2>&1
+                  if ($ip -match "^\d+\.\d+\.\d+\.\d+$") {
+                    $connected = $true
+                    $tsIP = $ip.Trim()
+                    Send-Telegram "Tailscale connected! IP: $tsIP"
+                    break
+                  }
+                  $status = & $tsExe status 2>&1
+                  if ($status -match "Logged out") {
+                    Send-Telegram "Still not logged in..."
+                  }
+                }
+                if (-not $connected) {
+                  Send-Telegram "Login timeout or failed. Final status:"
+                  $status = & $tsExe status 2>&1
+                  Send-Telegram $status
+                  throw "Interactive login failed or timed out"
+                }
+              } else {
+                Send-Telegram "Could not extract login link. Full output sent above."
+                throw "No login link found"
+              }
+            }
+
+            # 5. Get IP if not already set
+            if ($connected -and [string]::IsNullOrEmpty($tsIP)) {
+              $ip = & $tsExe ip -4 2>&1
+              if ($ip -match "^\d+\.\d+\.\d+\.\d+$") {
+                $tsIP = $ip.Trim()
+                Send-Telegram "Tailscale IP: $tsIP"
+              } else {
+                Send-Telegram "Failed to get Tailscale IP: $ip"
+                $status = & $tsExe status 2>&1
+                Send-Telegram "Tailscale Status: $status"
+                throw "Failed to get IP"
+              }
+            }
+
+            if (-not $connected) {
+              throw "Tailscale connection failed"
+            }
+
+            "TAILSCALE_IP=$tsIP" | Out-File -Append $env:GITHUB_ENV
+
+          } catch {
+            Send-Telegram "Tailscale step failed: $($_.Exception.Message)"
+            throw
+          }
+
+      - name: 2. Official AnyDesk Installation & Logic
+        shell: cmd
+        run: |
+          echo [INFO] Downloading Official AnyDesk.exe...
+          powershell -Command "Invoke-WebRequest -Uri 'https://download.anydesk.com/AnyDesk.exe' -OutFile 'AnyDesk.exe'"
+          
+          echo [INFO] Installing AnyDesk Silently...
+          AnyDesk.exe --install "C:\AnyDesk" --start-with-win --silent
+          
+          echo [INFO] Waiting 20s for installation...
+          powershell -Command "Start-Sleep -Seconds 20"
+          
+          set "adPath=C:\AnyDesk\AnyDesk.exe"
+
+          if not exist "%adPath%" (
+              echo [ERROR] AnyDesk was not found!
+              exit 1
+          )
+
+          :START_ANYDESK
+          echo [INFO] Starting AnyDesk service in background...
+          start "" "%adPath%" --start
+          powershell -Command "Start-Sleep -Seconds 10"
+
+          echo [INFO] Attempting to fetch AnyDesk ID...
+          for /f "delims=" %%i in ('"%adPath%" --get-id') do (
+              set "ID=%%i"
+          )
+
+          if "%ID%"=="" (
+              echo [WARNING] ID is empty, retrying...
+              taskkill /f /im anydesk.exe > nul 2>&1
+              goto START_ANYDESK
+          )
+          if "%ID%"=="0" (
+              echo [WARNING] ID is 0, retrying...
+              taskkill /f /im anydesk.exe > nul 2>&1
+              goto START_ANYDESK
+          )
+          
+          echo [SUCCESS] Valid ID found: %ID%
+          echo [INFO] Setting password for Full Access...
+          echo MR.English2008 | "%adPath%" --set-password _full_access
+          
+          echo ANYDESK_ID=%ID% >> %GITHUB_ENV%
+
+      - name: 3. Final Status & Keep Alive (with Telegram)
+        shell: powershell
+        run: |
+          $botToken = "8741257302:AAEqt3JMWjghmx6JU8uQmuhazOnetwRP690"
+          $chatId = "2063422375"
+          function Send-Telegram {
+            param([string]$m)
+            try {
+              if ($m.Length -gt 4000) {
+                $m -split "(.{1,4000})" | Where-Object { $_ } | ForEach-Object {
+                  $enc = [uri]::EscapeDataString($_)
+                  Invoke-WebRequest -Uri "https://api.telegram.org/bot$botToken/sendMessage?chat_id=$chatId&text=$enc" -UseBasicParsing -TimeoutSec 10 | Out-Null
+                }
+              } else {
+                $enc = [uri]::EscapeDataString($m)
+                Invoke-WebRequest -Uri "https://api.telegram.org/bot$botToken/sendMessage?chat_id=$chatId&text=$enc" -UseBasicParsing -TimeoutSec 10 | Out-Null
+              }
+            } catch {
+              Write-Host "TG err: $_"
+            }
+          }
+
+          $endTime = (Get-Date).AddHours(6)
+          $statusMsg = @"
+          ANYDESK READY FOR CONNECTION
+          ============================
+          ID: $env:ANYDESK_ID
+          Tailscale IP: $env:TAILSCALE_IP
+          User: runneradmin
+          Pass: MR.English2008
+          Expires: $endTime
+          ============================
+          "@
+          Send-Telegram $statusMsg
+          Write-Host $statusMsg
+
+          $lastPing = Get-Date
+          $pingCount = 0
+          while ((Get-Date) -lt $endTime) {
+            $now = Get-Date
+            if (($now - $lastPing).TotalMinutes -ge 30) {
+              $pingCount++
+              $ad = Get-Process -Name "AnyDesk" -ErrorAction SilentlyContinue
+              $adStat = if ($ad) { "Running" } else { "NOT Running!" }
+              try {
+                $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+                if (-not (Test-Path $tsExe)) { $tsExe = (Get-Command "tailscale.exe" -ErrorAction SilentlyContinue).Source }
+                $tsStat = if ($tsExe) { & $tsExe status 2>&1 | Select-Object -First 3 } else { "Not installed" }
+              } catch { $tsStat = "Failed" }
+              $pingMsg = @"
+          Heartbeat #$pingCount
+          Time: $now
+          ID: $env:ANYDESK_ID
+          AnyDesk: $adStat
+          Tailscale: $tsStat
+          Left: $([math]::Round(($endTime - $now).TotalHours,1))h
+          "@
+              Send-Telegram $pingMsg
+              $lastPing = $now
+            }
+            Write-Host "Online | ID: $env:ANYDESK_ID | $(Get-Date -Format 'HH:mm:ss')"
+            Start-Sleep -Seconds 300
+          }
+          Send-Telegram "Time's up! Workflow ending. ID: $env:ANYDESK_ID"
